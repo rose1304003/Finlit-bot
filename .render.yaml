@@ -1,7 +1,0 @@
-services:
-  - type: worker
-    name: finlit-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python finlit_registration_bot.py
-    autoDeploy: true
