@@ -2,4 +2,5 @@ python-telegram-bot==21.4
 pandas
 openpyxl
 python-dotenv
-psycopg2-binary
+mysql-connector-python
+
