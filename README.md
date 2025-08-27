@@ -1,222 +1,491 @@
-# Finlit Networking – Telegram Registration Bot
+# -*- coding: utf-8 -*-
 
-A production‑ready Telegram bot for event registration in Uzbek (Latin). It asks participants a step‑by‑step questionnaire, stores results in **SQLite**, continuously keeps an **Excel** file up to date, and DMs each completed registration to the organizers.
+"""
+Finlit Networking – Registration Bot (MySQL storage via storage.py)
 
-> **Repo one‑liner (description field):** Telegram bot for Finlit Networking registration — multi‑step form (UZ), SQLite + Excel export, admin stats, and organizer DM alerts.
+Features
 
----
+* Step-by-step registration (Uzbek Latin prompts)
+* Multi-select for Networking goals and Languages (inline buttons)
+* Single-select for preferred format (inline buttons)
+* Saves registrations in MySQL (see storage.py)
+* Auto-exports/updates Excel (data/registrations.xlsx)
+* DMs every completed registration to ORGANIZER\_IDS
+* Admin commands: /stats, /export\_excel, /whoami, /help
 
-## ✨ Features
+Run
+python finlit\_registration\_bot.py
+"""
+from **future** import annotations
+import os
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import List, Set
 
-* 📋 Guided, single/multi‑step registration in Uzbek (Latin)
-* ✅ Multi‑select with inline buttons: **Networking goals**, **Languages**
-* 🔘 Single‑select with inline buttons: **Preferred format** (Offline/Online/Hybrid)
-* 💾 Data persistence: **SQLite** (`data/finlit.db`)
-* 📊 Auto‑export to **Excel** on every successful registration (`data/registrations.xlsx`)
-* 📥 Instant **DM** to all organizers for each submission
-* 🔐 Admin commands: `/stats`, `/export_excel`, `/whoami`, `/help`
-* 🕒 Timezone aware (defaults to `Asia/Tashkent`)
+from dotenv import load\_dotenv
+from telegram import (
+Update,
+InlineKeyboardMarkup,
+InlineKeyboardButton,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+Application,
+CommandHandler,
+MessageHandler,
+CallbackQueryHandler,
+ConversationHandler,
+ContextTypes,
+filters,
+)
 
----
+# --- storage layer (MySQL) ---
 
-## 🧱 Tech Stack
+# Make sure storage.py (the MySQL version) is in the same folder.
 
-* Python 3.10+
-* [python-telegram-bot 21.x](https://docs.python-telegram-bot.org/)
-* SQLite + pandas + openpyxl
-* python-dotenv
+from storage import ensure\_db, Registration, export\_to\_excel, db\_connect
 
----
+# ---------------------- Setup & Config ----------------------
 
-## 📦 Project Structure
+load\_dotenv()
+BOT\_TOKEN = os.getenv("TELEGRAM\_BOT\_TOKEN")
+if not BOT\_TOKEN:
+raise SystemExit("Missing TELEGRAM\_BOT\_TOKEN in environment.")
+
+LOCAL\_TZ = os.getenv("LOCAL\_TZ", "Asia/Tashkent")
+TZ = ZoneInfo(LOCAL\_TZ)
+
+EXCEL\_PATH = os.getenv("EXCEL\_PATH", "data/registrations.xlsx")
+
+def parse\_admins(raw: str | None) -> List\[int]:
+if not raw:
+return \[]
+ids: List\[int] = \[]
+for part in raw\.split(','):
+part = part.strip()
+if part:
+try:
+ids.append(int(part))
+except ValueError:
+pass
+return ids
+
+ORGANIZER\_IDS: List\[int] = parse\_admins(os.getenv("ORGANIZER\_IDS"))
+
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("finlit-bot")
+
+# ---------------------- Helpers ----------------------
+
+NETWORKING\_OPTIONS = \[
+"Yangi tanishlar",
+"Hamkorlik imkoniyatlari",
+"Tajriba almashish",
+"Ilhom va g‘oyalar",
+]
+
+LANGUAGE\_OPTIONS = \[
+"O‘zbekcha",
+"Ruscha",
+"Inglizcha",
+]
+
+FORMAT\_OPTIONS = \[
+"Oflayn uchrashuv",
+"Onlayn format",
+"Gibrid",
+]
+
+# Conversation states
+
+(
+NAME,
+WORKPLACE,
+CAREER,
+INTERESTS,
+NETWORKING,
+REGION,
+LANGUAGES,
+LANGUAGES\_TEXT,
+TOPICS,
+MEET\_FORMAT,
+SELF\_DESC,
+CONFIRM,
+) = range(12)
+
+def is\_admin(user\_id: int) -> bool:
+return user\_id in ORGANIZER\_IDS
+
+def bold(s: str) -> str:
+return f"<b>{s}</b>"
+
+def make\_multiselect\_kb(options: List\[str], selected: Set\[str], with\_done: bool = True, with\_text\_alt: bool = False) -> InlineKeyboardMarkup:
+rows = \[]
+for opt in options:
+mark = "☑️" if opt in selected else "⬜️"
+rows.append(\[InlineKeyboardButton(text=f"{mark} {opt}", callback\_data=f"opt::{opt}")])
+extra = \[]
+if with\_text\_alt:
+extra.append(InlineKeyboardButton("✍️ Boshqa (yozib kiriting)", callback\_data="alt::text"))
+if with\_done:
+extra.append(InlineKeyboardButton("✅ Tayyor", callback\_data="done::ok"))
+if extra:
+rows.append(extra)
+return InlineKeyboardMarkup(rows)
+
+def make\_singleselect\_kb(options: List\[str]) -> InlineKeyboardMarkup:
+rows = \[]
+for opt in options:
+rows.append(\[InlineKeyboardButton(text=opt, callback\_data=f"pick::{opt}")])
+return InlineKeyboardMarkup(rows)
+
+def registration\_summary(reg: Registration) -> str:
+ulink = f"@{reg.telegram\_username}" if reg.telegram\_username else str(reg.telegram\_id)
+return (
+f"✅ {bold('Yangi ro‘yxatdan o‘tish!')}
+"
+f"{bold('Foydalanuvchi')}: {ulink}
+
+"
+f"{bold('👤 Ism-familiya')}: {reg.full\_name}
+"
+f"{bold('🏢 Ish/o‘qish joyi')}: {reg.workplace}
+"
+f"{bold('💼 Kasbiy yo‘nalish')}: {reg.career\_field}
+"
+f"{bold('📊 Qiziq sohalar')}: {reg.interests}
+"
+f"{bold('🤝 Networking maqsadi')}: {reg.networking\_goals}
+"
+f"{bold('🌍 Hudud')}: {reg.region}
+"
+f"{bold('🗣 Tillar')}: {reg.languages}
+"
+f"{bold('🚀 Qiziqqan mavzular')}: {reg.topics}
+"
+f"{bold('📱 Qulay format')}: {reg.meet\_format}
+"
+f"{bold('✨ Bir og‘izda')}: {reg.self\_desc}
+
+"
+f"{bold('Sana/vaqt')}: {reg.created\_at} ({LOCAL\_TZ})"
+)
+
+# ---------------------- Handlers: Core Flow ----------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data.clear()
+await update.message.reply\_text(
+"👋 Salom! Finlit Networking ro‘yxatdan o‘tish uchun quyidagi savollarga javob bering.
+
+"
+"Boshlaymiz. Avvalo, "
+"👤 Ismingiz va familiyangizni yuboring:")
+return NAME
+
+async def ask\_workplace(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["full\_name"] = update.message.text.strip()
+await update.message.reply\_text("🏢 Qaerda ishlaysiz yoki o‘qiysiz? (tashkilot/universitet nomi)")
+return WORKPLACE
+
+async def ask\_career(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["workplace"] = update.message.text.strip()
+await update.message.reply\_text("💼 Sizning kasbiy yo‘nalishingiz?")
+return CAREER
+
+async def ask\_interests(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["career\_field"] = update.message.text.strip()
+await update.message.reply\_text("📊 Qaysi moliyaviy yoki iqtisodiy sohalar siz uchun eng qiziqarli?")
+return INTERESTS
+
+async def ask\_networking(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["interests"] = update.message.text.strip()
+context.user\_data\["networking\_selected"] = set()
+kb = make\_multiselect\_kb(NETWORKING\_OPTIONS, set(), with\_done=True, with\_text\_alt=False)
+await update.message.reply\_text(
+"🤝 Networkingdan qanday maqsadda qatnashmoqchisiz? Bir nechta bandni tanlashingiz mumkin:",
+reply\_markup=kb,
+)
+return NETWORKING
+
+async def on\_networking\_cb(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+q = update.callback\_query
+await q.answer()
+data = q.data
+selected: Set\[str] = context.user\_data.get("networking\_selected", set())
+if data.startswith("opt::"):
+val = data.split("::", 1)\[1]
+if val in selected:
+selected.remove(val)
+else:
+selected.add(val)
+context.user\_data\["networking\_selected"] = selected
+await q.edit\_message\_reply\_markup(make\_multiselect\_kb(NETWORKING\_OPTIONS, selected))
+return NETWORKING
+elif data == "done::ok":
+if not selected:
+await q.reply\_text("Kamida bitta maqsadni tanlang, iltimos.")
+return NETWORKING
+await q.message.reply\_text("🌍 Qaysi hududdan qatnashyapsiz?")
+return REGION
+
+async def ask\_languages(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["region"] = update.message.text.strip()
+context.user\_data\["languages\_selected"] = set()
+kb = make\_multiselect\_kb(LANGUAGE\_OPTIONS, set(), with\_done=True, with\_text\_alt=True)
+await update.message.reply\_text(
+"🗣 Qaysi tillarda muloqot qilish qulay? Bir nechta bandni tanlang yoki "Boshqa" ni bosing.",
+reply\_markup=kb,
+)
+return LANGUAGES
+
+async def on\_languages\_cb(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+q = update.callback\_query
+await q.answer()
+data = q.data
+selected: Set\[str] = context.user\_data.get("languages\_selected", set())
+if data.startswith("opt::"):
+val = data.split("::", 1)\[1]
+if val in selected:
+selected.remove(val)
+else:
+selected.add(val)
+context.user\_data\["languages\_selected"] = selected
+await q.edit\_message\_reply\_markup(make\_multiselect\_kb(LANGUAGE\_OPTIONS, selected, with\_done=True, with\_text\_alt=True))
+return LANGUAGES
+elif data == "alt::text":
+await q.message.reply\_text("✍️ Qaysi boshqa tillar? Matn ko‘rinishida yozing (masalan: Nemischa, Turkcha).")
+return LANGUAGES\_TEXT
+elif data == "done::ok":
+if not selected and not context.user\_data.get("languages\_text"):
+await q.message.reply\_text("Iltimos, kamida bitta tilni tanlang yoki yozib yuboring.")
+return LANGUAGES
+await q.message.reply\_text("🚀 Finlit Networking davomida qaysi mavzular muhokama qilinishiga qiziqasiz?")
+return TOPICS
+
+async def languages\_text\_done(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["languages\_text"] = update.message.text.strip()
+await update.message.reply\_text("🚀 Finlit Networking davomida qaysi mavzular muhokama qilinishiga qiziqasiz?")
+return TOPICS
+
+async def ask\_format(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["topics"] = update.message.text.strip()
+kb = make\_singleselect\_kb(FORMAT\_OPTIONS)
+await update.message.reply\_text("📱 Sizga qaysi format qulayroq:", reply\_markup=kb)
+return MEET\_FORMAT
+
+async def on\_format\_cb(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+q = update.callback\_query
+await q.answer()
+data = q.data
+if data.startswith("pick::"):
+picked = data.split("::", 1)\[1]
+context.user\_data\["meet\_format"] = picked
+await q.message.reply\_text("✨ Bir og‘izda o‘zingizni qanday ifoda etgan bo‘lardingiz? (Masalan: "Men – ...")")
+return SELF\_DESC
+
+async def confirm(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data\["self\_desc"] = update.message.text.strip()
+reg = Registration.from\_context(context, update)
 
 ```
-.
-├─ finlit_registration_bot.py     # main single-file bot
-├─ data/                          # DB + Excel are created here
-│  ├─ finlit.db
-│  └─ registrations.xlsx
-├─ .env                           # secrets & config (not committed)
-└─ requirements.txt               # pinned deps (optional)
+text = (
+    f"{bold('Tekshiring:')}
 ```
 
-**requirements.txt** (optional)
+"
+f"{bold('👤 Ism-familiya')}: {reg.full\_name}
+"
+f"{bold('🏢 Ish/o‘qish joyi')}: {reg.workplace}
+"
+f"{bold('💼 Kasbiy yo‘nalish')}: {reg.career\_field}
+"
+f"{bold('📊 Qiziq sohalar')}: {reg.interests}
+"
+f"{bold('🤝 Networking maqsadi')}: {reg.networking\_goals}
+"
+f"{bold('🌍 Hudud')}: {reg.region}
+"
+f"{bold('🗣 Tillar')}: {reg.languages}
+"
+f"{bold('🚀 Mavzular')}: {reg.topics}
+"
+f"{bold('📱 Format')}: {reg.meet\_format}
+"
+f"{bold('✨ Men –')}: {reg.self\_desc}
+
+"
+"Hammasi to‘g‘rimi?"
+)
+kb = InlineKeyboardMarkup(\[
+\[InlineKeyboardButton("✅ Tasdiqlash", callback\_data="confirm::yes")],
+\[InlineKeyboardButton("↩️ Qayta boshlash", callback\_data="confirm::restart")],
+])
+await update.message.reply\_text(text, reply\_markup=kb, parse\_mode=ParseMode.HTML)
+return CONFIRM
+
+async def on\_confirm\_cb(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+q = update.callback\_query
+await q.answer()
+data = q.data
+if data == "confirm::restart":
+context.user\_data.clear()
+await q.message.reply\_text("Qaytadan boshlaymiz. 👤 Ismingiz va familiyangiz?")
+return NAME
+elif data == "confirm::yes":
+reg = Registration.from\_context(context, update)
+reg.save()
+\# Export (update) Excel silently
+try:
+export\_to\_excel(EXCEL\_PATH)
+except Exception as e:
+log.warning("Excel export failed: %s", e)
+\# Send receipts
+user\_msg = "✅ Ro‘yxatdan o‘tish tugadi!
+
+" + registration\_summary(reg)
+await q.message.reply\_text(user\_msg, parse\_mode=ParseMode.HTML)
+\# DM to organizers
+for admin\_id in ORGANIZER\_IDS:
+try:
+await q.bot.send\_message(chat\_id=admin\_id, text=registration\_summary(reg), parse\_mode=ParseMode.HTML)
+except Exception as e:
+log.warning("Failed to DM organizer %s: %s", admin\_id, e)
+return ConversationHandler.END
+
+# ---------------------- Handlers: Admin & Utility ----------------------
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+u = update.effective\_user
+await update.message.reply\_text(f"Sizning user id: {u.id}")
+
+async def help\_cmd(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+txt = "
+".join(\[
+"Buyruqlar:",
+"/start — ro‘yxatdan o‘tishni boshlash",
+"/whoami — user id ni ko‘rsatish",
+"/stats — (admin) registratsiyalar statistikasi",
+"/export\_excel — (admin) Excel faylini yuborish",
+])
+await update.message.reply\_text(txt)
+
+async def stats\_cmd(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+uid = update.effective\_user.id
+if not is\_admin(uid):
+return await update.message.reply\_text("Bu buyruq faqat adminlar uchun.")
 
 ```
-python-telegram-bot==21.4
-pandas
-openpyxl
-python-dotenv
+# MySQL query for counts
+with db_connect() as conn:
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM registrations")
+    total = cur.fetchone()[0]
+
+    # get created_at values
+    cur.execute("SELECT created_at FROM registrations")
+    rows = [r[0] for r in cur.fetchall()]
+
+now = datetime.now(TZ)
+today = now.date()
+start_of_week = (now - timedelta(days=now.weekday())).date()
+
+today_count = 0
+week_count = 0
+for v in rows:
+    # v may be a datetime or a string depending on connector
+    if isinstance(v, datetime):
+        d = v.date()
+    else:
+        try:
+            d = datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S").date()
+        except Exception:
+            try:
+                d = datetime.fromisoformat(str(v)).date()
+            except Exception:
+                continue
+    if d == today:
+        today_count += 1
+    if d >= start_of_week:
+        week_count += 1
+
+await update.message.reply_text(
+    f"📊 Statistikalar:
 ```
 
----
+"
+f"Jami: {total}
+"
+f"Bugun: {today\_count}
+"
+f"Ushbu hafta: {week\_count}"
+)
 
-## ⚙️ Configuration
+async def export\_excel\_cmd(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+uid = update.effective\_user.id
+if not is\_admin(uid):
+return await update.message.reply\_text("Bu buyruq faqat adminlar uchun.")
+path = export\_to\_excel(EXCEL\_PATH)
+try:
+await update.message.reply\_document(document=Path(path).open('rb'),
+filename=Path(EXCEL\_PATH).name,
+caption="Registratsiyalar (Excel)")
+except Exception as e:
+await update.message.reply\_text(f"Yuborishda xatolik: {e}")
 
-Create a file named **`.env`** next to `finlit_registration_bot.py`:
+# ---------------------- Cancel / Fallback ----------------------
 
-```
-TELEGRAM_BOT_TOKEN=123456789:AA...             # from @BotFather
-ORGANIZER_IDS=111111111,222222222              # comma-separated Telegram user_id(s)
-LOCAL_TZ=Asia/Tashkent                         # optional
-EXCEL_PATH=data/registrations.xlsx             # optional
-```
+async def cancel(update: Update, context: ContextTypes.DEFAULT\_TYPE):
+context.user\_data.clear()
+await update.message.reply\_text("Bekor qilindi. /start orqali qayta boshlashingiz mumkin.")
+return ConversationHandler.END
 
-How to get your **user\_id**: run `/whoami` in the bot, or message @userinfobot.
+# ---------------------- Main ----------------------
 
-> Keep the token private. Never commit `.env`.
-
----
-
-## ▶️ Run Locally
-
-```bash
-pip install -r requirements.txt
-# or: pip install python-telegram-bot==21.4 pandas openpyxl python-dotenv
-python finlit_registration_bot.py
-```
-
----
-
-## 🤖 BotFather Checklist
-
-* `/newbot` → name + username (must end with `bot`)
-* Copy the **HTTP API token** to `.env` as `TELEGRAM_BOT_TOKEN`
-* (Optional) Set commands:
+def build\_app() -> Application:
+ensure\_db()
 
 ```
-start - Ro‘yxatdan o‘tishni boshlash
-whoami - User ID ni ko‘rsatish
-stats - Registratsiyalar statistikasi (admin)
-export_excel - Excel faylini yuborish (admin)
-help - Yordam
+app = Application.builder().token(BOT_TOKEN).build()
+
+conv = ConversationHandler(
+    entry_points=[CommandHandler("start", start)],
+    states={
+        NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_workplace)],
+        WORKPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_career)],
+        CAREER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_interests)],
+        INTERESTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_networking)],
+        NETWORKING: [CallbackQueryHandler(on_networking_cb)],
+        REGION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_languages)],
+        LANGUAGES: [CallbackQueryHandler(on_languages_cb)],
+        LANGUAGES_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, languages_text_done)],
+        TOPICS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_format)],
+        MEET_FORMAT: [CallbackQueryHandler(on_format_cb)],
+        SELF_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+        CONFIRM: [CallbackQueryHandler(on_confirm_cb)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    allow_reentry=True,
+)
+
+app.add_handler(conv)
+app.add_handler(CommandHandler("whoami", whoami))
+app.add_handler(CommandHandler("help", help_cmd))
+app.add_handler(CommandHandler("stats", stats_cmd))
+app.add_handler(CommandHandler("export_excel", export_excel_cmd))
+
+return app
 ```
 
----
+def main():
+app = build\_app()
+log.info("Finlit Registration Bot started. Organizers: %s", ORGANIZER\_IDS)
+app.run\_polling(close\_loop=False)
 
-## 🧭 User Flow (short)
-
-1. `/start`
-2. Ask: Name → Workplace → Career field → Finance/Econ interests
-3. Multi‑select: Networking goals
-4. Region
-5. Multi‑select: Languages (with “Other” text option)
-6. Topics of interest
-7. Single‑select: Preferred format (Offline/Online/Hybrid)
-8. One‑line self‑description
-9. Confirmation → Save → Excel update → Organizer DM
-
----
-
-## 🗂️ Data Model
-
-Table: `registrations`
-
-```
-id (PK), telegram_id, telegram_username,
-full_name, workplace, career_field,
-interests, networking_goals,
-region, languages, topics,
-meet_format, self_desc,
-created_at (local ISO string)
-```
-
----
-
-## 🔒 Privacy & Security
-
-* Tokens are stored only in local `.env`. Do **not** commit `.env`.
-* If a token leaks, revoke it in @BotFather and replace.
-* SQLite/Excel files may contain personal data. Store and share securely.
-* To delete records, remove rows in SQLite/Excel as per your retention policy.
-
----
-
-## 🛠 Admin Commands
-
-* `/whoami` — returns your Telegram user\_id
-* `/stats` — total, today, and this week counts (admins only)
-* `/export_excel` — sends the current Excel file (admins only)
-* `/help` — command list
-
-> Admins are users listed in `ORGANIZER_IDS`.
-
----
-
-## 🧩 Customization
-
-You can edit prompt texts and options inside `finlit_registration_bot.py`:
-
-* `NETWORKING_OPTIONS = [ ... ]`
-* `LANGUAGE_OPTIONS = [ ... ]`
-* `FORMAT_OPTIONS = [ ... ]`
-* All question prompts are in handlers like `ask_*` functions.
-
-### Add a group/channel broadcast
-
-Add a command returning chat id (`/whereami`) and post submissions to that id.
-
----
-
-## 🐳 Docker (optional)
-
-**Dockerfile**
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "finlit_registration_bot.py"]
-```
-
-**Run**
-
-```bash
-docker build -t finlit-bot .
-docker run --env-file .env -v $(pwd)/data:/app/data finlit-bot
-```
-
----
-
-## ☁️ Deploy (Railway/Render/VM)
-
-* Create a new service from this repo
-* Add environment variables from `.env`
-* Set start command: `python finlit_registration_bot.py`
-* Ensure **persistent storage** (bind‑mount `data/` or a volume) if you need to keep DB/Excel
-
----
-
-## 🔍 Troubleshooting
-
-**Bot doesn’t DM organizers**
-
-* Each organizer must **start the bot at least once** (Telegram won’t allow unsolicited DM)
-* Check `ORGANIZER_IDS`
-
-**Excel not updating**
-
-* App has no write permission to `data/`
-* `openpyxl` not installed → `pip install openpyxl`
-
-**“Forbidden: bot was blocked by the user”**
-
-* The user/organizer blocked the bot or never started it. Ask them to message the bot first.
-
-**No updates arrive**
-
-* Token invalid or wrong bot → re‑check @BotFather token
-
----
-
-## 📝 License
-
-MIT — see `LICENSE` (add one if needed).
-
----
-
-## 🙌 Credits
-
-Designed for Finlit Networking (Uzbekistan). Built with python-telegram-bot, pandas, openpyxl.
+if **name** == "**main**":
+main()
