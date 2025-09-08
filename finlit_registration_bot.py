@@ -61,10 +61,8 @@ log = logging.getLogger("finlit-bot")
 
 # ---------------------- Conversation options ----------------------
 NETWORKING_OPTIONS = [
-    "Yangi tanishlar",
-    "Hamkorlik imkoniyatlari",
-    "Tajriba almashish",
-    "Ilhom va g‘oyalar",
+"Men rezidentman",
+"Men tomoshabinman",
 ]
 LANGUAGE_OPTIONS = ["O‘zbekcha", "Ruscha", "Inglizcha"]
 FORMAT_OPTIONS   = ["Oflayn uchrashuv", "Onlayn format", "Gibrid"]
