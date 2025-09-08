@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 Finlit Networking – Registration Bot (DM-only, no DB)
-
-• Asks: Full name → Workplace → Career → Interests → Networking goals (multi)
-        → Region → Languages (multi) → Preferred format → Phone number
-• On completion: sends a full summary back to the user AND DMs the owner(s)
+Adds:
+• Thank-you message after successful registration
+• File-based registry of registered user IDs (data/registered.json)
+• Admin commands:
+    /broadcast <text>    → DM to all registered users
+    /registered_count    → how many registered
 
 Env (.env / Railway Variables)
   TELEGRAM_BOT_TOKEN=123456:AA...
-  ORGANIZER_IDS=111111111,222222222   # Telegram user IDs to DM
-  LOCAL_TZ=Asia/Tashkent              # optional, default: Asia/Tashkent
+  ORGANIZER_IDS=111111111,222222222
+  LOCAL_TZ=Asia/Tashkent                 (optional)
+  REG_DB_PATH=data/registered.json       (optional; default as shown)
 """
 
 from __future__ import annotations
 import os
+import json
 import logging
+import time
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Set
@@ -40,6 +46,10 @@ if not BOT_TOKEN:
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Asia/Tashkent")
 TZ = ZoneInfo(LOCAL_TZ)
 
+# Where we store registered user IDs (flat JSON file)
+REG_DB_PATH = Path(os.getenv("REG_DB_PATH", "data/registered.json"))
+REG_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 def parse_admins(raw: str | None) -> List[int]:
     if not raw:
         return []
@@ -59,10 +69,29 @@ ORGANIZER_IDS: List[int] = parse_admins(os.getenv("ORGANIZER_IDS"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("finlit-bot")
 
+# ---------------------- Tiny registry (file-based) ----------------------
+def _load_registered_ids() -> Set[int]:
+    if not REG_DB_PATH.exists():
+        return set()
+    try:
+        data = json.loads(REG_DB_PATH.read_text(encoding="utf-8"))
+        return set(int(x) for x in data)
+    except Exception:
+        return set()
+
+def _save_registered_ids(ids: Set[int]) -> None:
+    REG_DB_PATH.write_text(json.dumps(sorted(list(ids))), encoding="utf-8")
+
+def add_registered_user(user_id: int) -> None:
+    ids = _load_registered_ids()
+    if user_id not in ids:
+        ids.add(user_id)
+        _save_registered_ids(ids)
+
 # ---------------------- Conversation options ----------------------
 NETWORKING_OPTIONS = [
-"Men rezidentman",
-"Men tomoshabinman",
+    "Men rezidentman",
+    "Men tomoshabinman",
 ]
 LANGUAGE_OPTIONS = ["O‘zbekcha", "Ruscha", "Inglizcha"]
 FORMAT_OPTIONS   = ["Oflayn uchrashuv", "Onlayn format", "Gibrid"]
@@ -246,11 +275,19 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["phone"] = phone
 
-    # Build summary
+    # Build summary and thank-you
     summary = build_summary(context.user_data, update.effective_user)
+    thanks = (
+        "🎉 Rahmat! Ro‘yxatdan o‘tish muvaffaqiyatli yakunlandi.\n"
+        "Tez orada tafsilotlarni ulashamiz. Savollar bo‘lsa — shu yerda yozishingiz mumkin."
+    )
 
     # Send to user
     await update.message.reply_text("✅ Ro‘yxatdan o‘tish tugadi!\n\n" + summary, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(thanks)
+
+    # Track as registered (for future broadcasts)
+    add_registered_user(update.effective_user.id)
 
     # DM organizers/owner(s)
     for admin_id in ORGANIZER_IDS:
@@ -261,7 +298,10 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-# ---------------------- Commands ----------------------
+# ---------------------- Admin Commands ----------------------
+def _is_admin(user_id: int) -> bool:
+    return user_id in ORGANIZER_IDS
+
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Sizning user id: {update.effective_user.id}")
 
@@ -270,9 +310,44 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Buyruqlar:\n"
         "/start — ro‘yxatdan o‘tishni boshlash\n"
         "/whoami — user id ni ko‘rsatish\n"
+        "/registered_count — ro‘yxatdan o‘tganlar soni (admin)\n"
+        "/broadcast <matn> — ro‘yxatdan o‘tganlarga xabar yuborish (admin)\n"
         "/cancel — bekor qilish"
     )
 
+async def registered_count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
+    count = len(_load_registered_ids())
+    await update.message.reply_text(f"📊 Ro‘yxatdan o‘tganlar soni: {count}")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
+
+    # Get message text: either argument after command, or the text of a replied message
+    text = update.message.text.partition(" ")[2].strip()
+    if not text and update.message.reply_to_message:
+        text = update.message.reply_to_message.text or ""
+    if not text:
+        return await update.message.reply_text("Foydalanish: /broadcast Matn... (yoki xabarga reply qilib /broadcast)")
+
+    ids = sorted(_load_registered_ids())
+    if not ids:
+        return await update.message.reply_text("Ro‘yxatdan o‘tgan foydalanuvchilar ro‘yxati bo‘sh.")
+
+    ok = 0
+    fail = 0
+    for uid in ids:
+        try:
+            await update.message.get_bot().send_message(chat_id=uid, text=text)
+            ok += 1
+            time.sleep(0.05)  # small delay to be nice to Telegram
+        except Exception:
+            fail += 1
+    await update.message.reply_text(f"Yuborildi: {ok}, Xato: {fail}")
+
+# ---------------------- Cancel / Fallback ----------------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Bekor qilindi. /start orqali qayta boshlashingiz mumkin.")
@@ -303,6 +378,8 @@ def build_app() -> Application:
     app.add_handler(conv)
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("registered_count", registered_count_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     return app
 
 def main():
