@@ -1,6 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Finlit Networking – Registration Bot (UZ/RU language choice, file-based registry)
+Adds:
+• Thank-you message after successful registration
+• File-based registry of registered user IDs (data/registered.json)
+• Admin commands:
+    /broadcast <text>    → DM to all registered users
+    /registered_count    → how many registered
+
+Env (.env / Railway Variables)
+  TELEGRAM_BOT_TOKEN=123456:AA...
+  ORGANIZER_IDS=111111111,222222222
+  LOCAL_TZ=Asia/Tashkent                 (optional)
+  REG_DB_PATH=data/registered.json       (optional; default as shown)
 """
 
 import os, json, logging, time
@@ -23,6 +35,9 @@ from telegram.ext import (
 # ---------------- Config ----------------
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment.")
+
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Asia/Tashkent")
 TZ = ZoneInfo(LOCAL_TZ)
 REG_DB_PATH = Path(os.getenv("REG_DB_PATH", "data/registered.json"))
@@ -57,8 +72,8 @@ def add_registered_user(uid: int) -> None:
 def t(lang, key):
     texts = {
         "start": {
-            "uz": "👋 Salom! Finlit Networking ro‘yxatdan o‘tish uchun quyidagi savollarga javob bering.\n\nMuloqot tilini tanlang:",
-            "ru": "👋 Здравствуйте! Ответьте на следующие вопросы, чтобы зарегистрироваться в Finlit Networking.\n\nВыберите язык:"
+            "uz": "👋 Salom! Finlit Networking ro‘yxatdan o‘tish uchun quyidagi savollarga javob bering.\n\n👉 Muloqot tilini tanlang:",
+            "ru": "👋 Здравствуйте! Ответьте на следующие вопросы, чтобы зарегистрироваться в Finlit Networking.\n\n👉 Выберите язык:"
         },
         "name": {
             "uz": "Boshlaymiz. Avvalo, 👤 ismingiz va familiyangizni yuboring:",
@@ -89,7 +104,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("UZ", callback_data="lang:uz"),
          InlineKeyboardButton("RU", callback_data="lang:ru")]
     ])
-    await update.message.reply_text(t("uz","start")+"\n"+t("ru","start"), reply_markup=kb)
+    await update.message.reply_text(
+        f"{t('uz','start')}\n\n{t('ru','start')}",
+        reply_markup=kb
+    )
     return LANG
 
 async def on_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,8 +152,8 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🤝 {context.user_data['purpose']}
 📞 {phone}
 """
-    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
-    await update.message.reply_text(t(lang,"done"))
+    await update.message.reply_text("✅ " + t(lang,"done"), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(summary)
 
     add_registered_user(update.effective_user.id)
     for admin_id in ORGANIZER_IDS:
@@ -145,6 +163,33 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("Failed DM admin: %s", e)
 
     return ConversationHandler.END
+
+# ---------------- Admin Commands ----------------
+def _is_admin(user_id: int) -> bool:
+    return user_id in ORGANIZER_IDS
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Sizning user id: {update.effective_user.id}")
+
+async def registered_count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
+    count = len(_load_registered_ids())
+    await update.message.reply_text(f"📊 Ro‘yxatdan o‘tganlar soni: {count}")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        return await update.message.reply_text("Bu buyruq faqat adminlar uchun.")
+    text = update.message.text.partition(" ")[2].strip()
+    ids = sorted(_load_registered_ids())
+    ok = fail = 0
+    for uid in ids:
+        try:
+            await update.message.get_bot().send_message(chat_id=uid, text=text)
+            ok += 1
+            time.sleep(0.05)
+        except: fail += 1
+    await update.message.reply_text(f"Yuborildi: {ok}, Xato: {fail}")
 
 # ---------------- App ----------------
 def build_app():
@@ -161,9 +206,13 @@ def build_app():
         fallbacks=[]
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("registered_count", registered_count_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     return app
 
 def main():
+    log.info("Finlit Registration Bot starting… Admins: %s", ORGANIZER_IDS)
     app = build_app()
     app.run_polling()
 
