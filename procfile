@@ -1,0 +1,1 @@
+worker: python -u finlit_registration_bot.py
