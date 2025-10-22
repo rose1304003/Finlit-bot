@@ -5,7 +5,7 @@ Finlit Networking – Registration Bot (UZ/RU; file-based registry; admin stats)
 Features:
 • Language choice (UZ/RU)
 • Registration flow: name → birthdate → purpose (Rezident/Tomoshabin) → phone
-• Thank-you message + summary
+• Thank-you message + summary + bilingual invite to join channel
 • File-based registry (JSON) with structured records:
     { id, purpose, ts, name, birth, phone, lang }
 • Admin-only DMs on each registration (to ORGANIZER_IDS only)
@@ -20,6 +20,7 @@ Env (.env / Railway Variables)
   ORGANIZER_IDS=111111111,222222222
   LOCAL_TZ=Asia/Tashkent                 (optional, default as shown)
   REG_DB_PATH=data/registered.json       (optional, default as shown)
+  GROUP_INVITE_URL=https://t.me/+OJgdgkTOsLEyYjNi  (optional; default as shown below)
 
 Notes:
 • If you previously used a version that stored just a list of IDs, this version
@@ -61,6 +62,8 @@ TZ = ZoneInfo(LOCAL_TZ)
 REG_DB_PATH = Path(os.getenv("REG_DB_PATH", "data/registered.json"))
 REG_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+GROUP_INVITE_URL = os.getenv("GROUP_INVITE_URL", "https://t.me/+OJgdgkTOsLEyYjNi")
+
 def parse_admins(raw: str | None) -> List[int]:
     if not raw:
         return []
@@ -94,7 +97,7 @@ def t(lang: str, key: str) -> str:
         },
         "purpose": {
             "uz": "🤝 Networkingdan qanday maqsadda qatnashmoqchisiz?",
-            "ru": "🤝 Какова цель вашего общения?"
+            "ru": "🤝 Какова цель вашего участия?"
         },
         "phone": {
             "uz": "📞 Telefon raqamingizni yuboring (matn ko‘rinishida yoki tugma orqali ulashishingiz mumkin):",
@@ -114,6 +117,16 @@ def t(lang: str, key: str) -> str:
         }
     }
     return texts[key][lang if lang in ("uz", "ru") else "uz"]
+
+def join_invite_text() -> str:
+    return (
+        "📢 <b>Kanalga qo‘shiling!</b>\n"
+        "Finlit Networking yangiliklari, e’lonlar va foydali resurslar shu yerda bo‘ladi.\n"
+        "👉 Pastdagi tugma orqali a’zo bo‘ling.\n\n"
+        "📢 <b>Присоединяйтесь к каналу!</b>\n"
+        "Анонсы, новости и полезные материалы по Finlit Networking публикуются в нашем канале.\n"
+        "👉 Нажмите кнопку ниже, чтобы подписаться."
+    )
 
 # ---------------- Registry ----------------
 def _load_registry() -> List[Dict[str, Any]]:
@@ -203,7 +216,7 @@ async def on_birth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["birth"] = (update.message.text or "").strip()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Rezident / Резидент", callback_data="purpose:rezident")],
-        [InlineKeyboardButton("Speeker / Speeker", callback_data="purpose:tomoshabin")]
+        [InlineKeyboardButton("Tomoshabin / Зритель", callback_data="purpose:tomoshabin")]
     ])
     await update.message.reply_text(
         t(context.user_data.get("lang", "uz"), "purpose"),
@@ -268,6 +281,19 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text(summary)
 
+    # Bilingual channel invite with buttons
+    invite_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Kanalga qo‘shilish", url=GROUP_INVITE_URL),
+            InlineKeyboardButton("➕ Подписаться", url=GROUP_INVITE_URL),
+        ]
+    ])
+    await update.message.reply_text(
+        join_invite_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=invite_kb
+    )
+
     # DM admins only (never to regular users)
     for admin_id in ORGANIZER_IDS:
         try:
@@ -288,7 +314,6 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def registered_count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = "uz"
     if update and update.effective_user:
-        # Try to honor user's last chosen lang if present in memory
         lang = context.user_data.get("lang", "uz")
     if not _is_admin(update.effective_user.id):
         return await update.message.reply_text(t(lang, "admins_only"))
@@ -317,7 +342,6 @@ async def daily_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             ts = datetime.fromisoformat(ts_str)
-            # If ts is naive, localize; else convert
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=TZ)
             ts_d = ts.astimezone(TZ).date()
@@ -386,8 +410,8 @@ def build_app() -> Application:
     return app
 
 def main():
-    log.info("Finlit Registration Bot starting… Admins: %s | TZ: %s | DB: %s",
-             ORGANIZER_IDS, LOCAL_TZ, str(REG_DB_PATH))
+    log.info("Finlit Registration Bot starting… Admins: %s | TZ: %s | DB: %s | Invite: %s",
+             ORGANIZER_IDS, LOCAL_TZ, str(REG_DB_PATH), GROUP_INVITE_URL)
     app = build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
