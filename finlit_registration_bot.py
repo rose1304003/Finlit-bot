@@ -203,7 +203,7 @@ async def on_birth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["birth"] = (update.message.text or "").strip()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Rezident / Резидент", callback_data="purpose:rezident")],
-        [InlineKeyboardButton("Tomoshabin / Зритель", callback_data="purpose:tomoshabin")]
+        [InlineKeyboardButton("Speeker / Speeker", callback_data="purpose:tomoshabin")]
     ])
     await update.message.reply_text(
         t(context.user_data.get("lang", "uz"), "purpose"),
