@@ -351,14 +351,14 @@ async def daily_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ts_d == yesterday:
             if purpose == "rezident":
                 rez += 1
-            elif purpose == "tomoshabin":
+            elif purpose == "speeker":
                 tomo += 1
 
     total = rez + tomo
     msg = (
         f"📊 Kecha ({yesterday.isoformat()}) natijalar:\n"
         f"• Rezidentlar: {rez}\n"
-        f"• Tomoshabinlar: {tomo}\n"
+        f"• Speekerlar: {tomo}\n"
         f"• Jami: {total}"
     )
     await update.message.reply_text(msg)
