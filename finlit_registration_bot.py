@@ -265,7 +265,7 @@ async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Build summary
     purpose_h = {
         "rezident": "Rezident / Резидент",
-        "tomoshabin": "Tomoshabin / Зритель"
+        "speeker": "Speeker /Speeker"
     }.get(purpose, purpose)
 
     summary = (
